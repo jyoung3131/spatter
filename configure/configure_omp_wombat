@@ -1,6 +1,9 @@
 # Configure file for compiling with OpenCL
 # Execute from the main directory using ./configure/configure_ocl
 
+#Run the submodule update script
+./configure/git_submodule_init.sh
+
 BUILD_DIR=build_omp_arm
 
 mkdir -p ${BUILD_DIR} && cd ${BUILD_DIR}

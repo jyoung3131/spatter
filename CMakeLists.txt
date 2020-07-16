@@ -1,9 +1,9 @@
-# 3.8 is specified since this is the first version with CUDA support
-CMAKE_MINIMUM_REQUIRED (VERSION 3.8 FATAL_ERROR)
+# 3.10 is specified since this is the first version with FindCUDAToolkit support
+CMAKE_MINIMUM_REQUIRED (VERSION 3.10 FATAL_ERROR)
 
 SET (CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-#Set target project name
+# Set target project name
 SET (TRGT spatter)
 
 # Set default values
@@ -74,9 +74,14 @@ IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "Cray")
     SET (CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} -DSPAT_C_NAME=Cray -D__CRAYC__")
 ENDIF ()
 
+IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "Intel") 
+    SET (OpenMP_C_FLAGS "${OpenMP_C_FLAGS} -xHost")
+    SET (OpenMP_C_FLAGS "${OpenMP_CXX_FLAGS} -xHost")
+ENDIF ()
+
  
 IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU") 
-    SET(CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} -DSPAT_C_NAME=GNU -O3")
+    SET(CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} -DSPAT_C_NAME=GNU -O3 -g")
    #Use sanitize=address for debugging of access issues 
    #SET(CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} -fsanitize=address")
 ENDIF ()
@@ -89,6 +94,12 @@ ENDIF ()
 #Add configure-specified flags
 SET (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -I${CMAKE_CURRENT_SOURCE_DIR}/include")
 SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+
+#Check if Spatter is compiled on MacOSX. If so, use POSIX_MEMALIGN to allocate memory
+IF (APPLE)
+	ADD_DEFINITIONS (-DUSE_POSIX_MEMALIGN)
+ENDIF ()
 
 # Enable OpenCL
 IF (USE_OPENCL)
@@ -126,30 +137,16 @@ ENDIF ()
 # Enable OpenMP
 IF (USE_OPENMP)
     FIND_PACKAGE (OpenMP REQUIRED)
-    IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "Cray") 
-        SET (OpenMP_C_FLAGS "${OpenMP_C_FLAGS} -homp")
-        SET (OpenMP_C_FLAGS "${OpenMP_CXX_FLAGS} -homp")
-    ENDIF ()
-    IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU") 
-        SET (OpenMP_C_FLAGS "${OpenMP_C_FLAGS} -fopenmp")
-        SET (OpenMP_C_FLAGS "${OpenMP_CXX_FLAGS} -fopenmp")
-    ENDIF ()
-    IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "Intel") 
-        SET (OpenMP_C_FLAGS "${OpenMP_C_FLAGS} -qopenmp")
-        SET (OpenMP_C_FLAGS "${OpenMP_CXX_FLAGS} -qopenmp")
-    ENDIF ()
-    SET (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-    SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-    SET (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
+    if(OpenMP_FOUND)
+	# enable pragma regions in the code for OpenMP
+        ADD_DEFINITIONS (-DUSE_OPENMP)
+        ADD_DEFINITIONS (-DUSE_OMP_SIMD)
+        INCLUDE_DIRECTORIES (src/openmp)
 
-    # enable pragma regions in the code for OpenMP
-    ADD_DEFINITIONS (-DUSE_OPENMP)
-    ADD_DEFINITIONS (-DUSE_OMP_SIMD)
-    INCLUDE_DIRECTORIES (src/openmp)
-
-    # Pull the OpenMP-specific files and kernels into the build
-    FILE (GLOB BACKEND_C_FILES_OMP src/openmp/*.c)
-    FILE (GLOB BACKEND_H_FILES_OMP src/openmp/*.h)
+        # Pull the OpenMP-specific files and kernels into the build
+        FILE (GLOB BACKEND_C_FILES_OMP src/openmp/*.c)
+        FILE (GLOB BACKEND_H_FILES_OMP src/openmp/*.h)
+    ENDIF ()
 ENDIF ()
 
 # Enable CUDA
@@ -213,9 +210,21 @@ set_property(TARGET ${TRGT} PROPERTY C_STANDARD 11)
 # Print out debug info print_all_variables()
 
 # Link with the appropriate libraries
+IF (USE_OPENMP)
+    TARGET_LINK_LIBRARIES (${TRGT} LINK_PUBLIC OpenMP::OpenMP_CXX)
+ENDIF()
+
 IF (USE_OPENCL)
     TARGET_LINK_LIBRARIES (${TRGT} LINK_PUBLIC OpenCL)
 ENDIF ()
+
+# Link argtable
+
+INCLUDE_DIRECTORIES("${PROJECT_SOURCE_DIR}/external/argtable3/src")
+LINK_DIRECTORIES("${PROJECT_SOURCE_DIR}/external/argtable3")
+ADD_SUBDIRECTORY("${PROJECT_SOURCE_DIR}/external/argtable3")
+TARGET_LINK_LIBRARIES(${TRGT} LINK_PUBLIC argtable3_static)
+
 
 # Link math library for json
 TARGET_LINK_LIBRARIES (${TRGT} LINK_PUBLIC m)
@@ -247,6 +256,16 @@ message (STATUS "compiler version is ${CMAKE_C_COMPILER_VERSION}")
 message (STATUS "compiler is ${CMAKE_C_COMPILER}")
 SET (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DSPAT_C=\"${CMAKE_C_COMPILER}\"")
 SET (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DSPAT_C_VER=\"${CMAKE_C_COMPILER_VERSION}\"")
+
+
+# Build tests
+mark_as_advanced( BUILD_TESTS )
+set( BUILD_TESTS true CACHE BOOL "Tests build target available if true" )
+if( BUILD_TESTS )
+    enable_testing()
+    add_subdirectory( tests )
+endif( BUILD_TESTS )
+
 
 # Note - This file can be reformatted with cmake-format CMakeLists.txt -i
 # --command-case=upper --keyword-case=upper --dangle-parens --tab-size=4

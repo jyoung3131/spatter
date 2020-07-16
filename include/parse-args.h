@@ -1,6 +1,6 @@
 /** @file parse-args.h
  *  @author Patrick Lavin
- *  @brief Provides a function to read CLI 
+ *  @brief Provides a function to read CLI
  */
 
 #ifndef PARSE_ARGS_H
@@ -10,10 +10,11 @@
 #define ERROR 1
 
 
-#define STRING_SIZE 100
-#define MAX_PATTERN_LEN 64
+#define STRING_SIZE 10000
+#define MAX_PATTERN_LEN 1024
 
 #include <sgtype.h>
+#include <stdint.h>
 
 /** @brief Supported benchmark backends
  */
@@ -29,9 +30,9 @@ enum sg_backend
 enum sg_kernel
 {
     INVALID_KERNEL=0,
-    SCATTER, 
-    GATHER, 
-    SG,    
+    SCATTER,
+    GATHER,
+    SG,
 };
 
 enum sg_op
@@ -46,8 +47,10 @@ enum idx_type
 {
     UNIFORM,
     MS1,
+    LAPLACIAN,
     CUSTOM,
     CONFIG_FILE,
+    XKP,
     INVALID_IDX
 };
 
@@ -57,7 +60,7 @@ enum state
     NOTRUN,
     INVALID_STATE,
     VALID_STATE
-}; 
+};
 */
 
 struct run_config
@@ -86,6 +89,13 @@ struct run_config
     double *time_ms;
     long long **papi_ctr;
     int papi_counters;
+    int stride_kernel;
+    // Reorder based kernels
+    int ro_morton;
+    int ro_hilbert;
+    int ro_block;
+    uint32_t *ro_order;
+    uint32_t *ro_order_dev;
 };
 
 struct backend_config
@@ -98,10 +108,10 @@ struct backend_config
     char device_string[STRING_SIZE];
     char kernel_file[STRING_SIZE];
     char kernel_name[STRING_SIZE];
-    
+
 };
 
-/** @brief Read command-line arguments and populate global variables. 
+/** @brief Read command-line arguments and populate global variables.
  *  @param argc Value passed to main
  *  @param argv Value passed to main
  */
@@ -109,4 +119,4 @@ void parse_args(int argc, char **argv, int *nrc, struct run_config **rc);
 struct run_config parse_runs(int arrr, char **argv);
 void error (char* what, int code);
 void print_run_config(struct run_config rc);
-#endif 
+#endif

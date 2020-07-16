@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <math.h>
 //#include "ocl-kernel-gen.h"
 #include "parse-args.h"
 #include "sgtype.h"
@@ -11,6 +12,8 @@
 #include "sgtime.h"
 #include "trace-util.h"
 #include "sp_alloc.h"
+#include "morton.h"
+#include "hilbert3d.h"
 
 #if defined( USE_OPENCL )
 	#include "../opencl/ocl-backend.h"
@@ -38,24 +41,29 @@
 #define xstr(s) str(s)
 #define str(s) #s
 
+const char* SPATTER_VERSION="0.4";
+
 //SGBench specific enums
-enum sg_backend backend = INVALID_BACKEND;
+extern enum sg_backend backend;
 
 //Strings defining program behavior
-char platform_string[STRING_SIZE];
-char device_string[STRING_SIZE];
-char kernel_file[STRING_SIZE];
-char kernel_name[STRING_SIZE];
+extern char platform_string[STRING_SIZE];
+extern char device_string[STRING_SIZE];
+extern char kernel_file[STRING_SIZE];
+extern char kernel_name[STRING_SIZE];
 
-int validate_flag = 0, quiet_flag = 0;
-int aggregate_flag = 1;
-int compress_flag = 0;
-int papi_nevents = 0;
+extern int cuda_dev;
+extern int validate_flag;
+extern int quiet_flag;
+extern int aggregate_flag;
+extern int compress_flag;
+extern int papi_nevents;
+extern int stride_kernel;
 #ifdef USE_PAPI
-char papi_event_names[PAPI_MAX_COUNTERS][STRING_SIZE];
+extern char papi_event_names[PAPI_MAX_COUNTERS][STRING_SIZE];
 int papi_event_codes[PAPI_MAX_COUNTERS];
 long long papi_event_values[PAPI_MAX_COUNTERS];
-extern const char* const papi_ctr_str[]; 
+extern const char* const papi_ctr_str[];
 #endif
 
 void print_papi_names() {
@@ -75,7 +83,7 @@ void print_papi_names() {
 }
 void print_system_info(){
 
-    printf("\nRunning Spatter version 0.0\n");
+    printf("\nRunning Spatter version %s\n",SPATTER_VERSION);
     printf("Compiler: %s ver. %s\n", xstr(SPAT_C_NAME), xstr(SPAT_C_VER));
     printf("Compiler Location: %s\n", xstr(SPAT_C));
     //printf("Contributors: Patrick Lavin, Jeff Young, Aaron Vose\n");
@@ -85,10 +93,17 @@ void print_system_info(){
     if(backend == OPENCL) printf("OPENCL\n");
     if(backend == CUDA) printf("CUDA\n");
 
-    
-    printf("Aggregate Results? %s\n", aggregate_flag ? "YES" : "NO"); 
+
+    printf("Aggregate Results? %s\n", aggregate_flag ? "YES" : "NO");
+#ifdef USE_CUDA
+    if (backend == CUDA) {
+        struct cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, cuda_dev);
+        printf("Device: %s\n", prop.name);
+    }
+#endif
     print_papi_names();
-    
+
     printf("\n");
 }
 
@@ -102,14 +117,22 @@ void print_header(){
     }
 #endif
     printf("\n");
+
+}
+
+int compare (const void * a, const void * b)
+{
+    if (*(double*)a > *(double*)b) return 1;
+    else if (*(double*)a < *(double*)b) return -1;
+    else return 0;
 }
 
 /** Time reported in seconds, sizes reported in bytes, bandwidth reported in mib/s"
  */
-void report_time(int ii, double time,  struct run_config rc, int idx){
+double report_time(int ii, double time,  struct run_config rc, int idx){
     size_t bytes_moved = 0;
     double actual_bandwidth = 0;
-    
+
     bytes_moved = sizeof(sgData_t) * rc.pattern_len * rc.generic_len;
     actual_bandwidth = bytes_moved / time / 1000. / 1000.;
     printf("%-7d %-12.4g %-12.6g", ii, time, actual_bandwidth);
@@ -119,9 +142,13 @@ void report_time(int ii, double time,  struct run_config rc, int idx){
     }
 #endif
     printf("\n");
+    return actual_bandwidth;
 }
 
+
 void report_time2(struct run_config* rc, int nrc) {
+    double *bw = (double*)malloc(sizeof(double)*nrc);
+    assert(bw);
     for (int k = 0; k < nrc; k++) {
         if (aggregate_flag) {
             double min_time_ms = rc[k].time_ms[0];
@@ -132,7 +159,7 @@ void report_time2(struct run_config* rc, int nrc) {
                     min_idx = i;
                 }
             }
-            report_time(k, min_time_ms/1000., rc[k], min_idx);
+            bw[k] = report_time(k, min_time_ms/1000., rc[k], min_idx);
         }
         else {
             for (int i = 0; i < rc[k].nruns; i++) {
@@ -140,6 +167,63 @@ void report_time2(struct run_config* rc, int nrc) {
             }
         }
     }
+    if (aggregate_flag) {
+        double min = bw[0];
+        double max = bw[0];
+        double hmean = 0;
+        double first, med, third;
+
+        qsort(bw, nrc, sizeof(double), compare);
+
+        for (int i = 0; i < nrc; i++) {
+            if (bw[i] < min) {
+                min = bw[i];
+            }
+            if (bw[i] > max) {
+                max = bw[i];
+            }
+        }
+
+        first = bw[nrc/4];
+        med = bw[nrc/2];
+        third = bw[3*nrc/4];
+
+        // Harmonic mean
+        for (int i = 0; i < nrc; i++) {
+            hmean += 1./bw[i];
+        }
+        hmean = 1./hmean * nrc;
+
+        // Harmonic Standard Error
+        // Reference: The Standard Errors of the Geometric and
+        // Harmonic Means and Their Application to Index Numbers
+        // Author: Nilan Norris
+        // URL: https://www.jstor.org/stable/2235723
+        double E1_x = 0;
+        for (int i = 0; i < nrc; i++) {
+            E1_x += 1./bw[i];
+        }
+        E1_x = E1_x / nrc;
+
+        double theta_22 = pow(1./E1_x, 2);
+
+        double sig_1x = 0;
+        for (int i = 0; i < nrc; i++) {
+            sig_1x += pow(1./bw[i] - E1_x,2);
+        }
+        sig_1x = sqrt(sig_1x / nrc);
+
+        double hstderr = theta_22 * sig_1x / sqrt(nrc);
+
+        printf("\n%-11s %-12s %-12s %-12s %-12s\n", "Min", "25%","Med","75%", "Max");
+        printf("%-12.6g %-12.6g %-12.6g %-12.6g %-12.6g\n", min, first, med, third, max);
+        printf("%-12s %-12s\n", "H.Mean", "H.StdErr");
+        printf("%-12.6g %-12.6g\n", hmean, hstderr);
+        /*
+        printf("%.3lf\t%.3lf\n", hmean, stddev);
+        */
+    }
+    free(bw);
 
 }
 
@@ -157,6 +241,8 @@ void print_sizet(size_t *buf, size_t len){
 }
 
 void emit_configs(struct run_config *rc, int nconfigs);
+uint64_t isqrt(uint64_t x);
+uint64_t icbrt(uint64_t x);
 
 
 int main(int argc, char **argv)
@@ -166,23 +252,22 @@ int main(int argc, char **argv)
     // Declare Variables
     // =======================================
 
-    // source and target are used for the gather and scatter operations. 
+    // source and target are used for the gather and scatter operations.
     // data is gathered from source and placed into target
     sgDataBuf  source;
     sgDataBuf  target;
 
-    // OpenCL Specific 
+    // OpenCL Specific
+    #ifdef USE_OPENCL
     size_t global_work_size = 1;
     char   *kernel_string;
-
-    #ifdef USE_OPENCL
     cl_uint work_dim = 1;
     #endif
-    
+
     // =======================================
     // Parse Command Line Arguments
     // =======================================
-    
+
     struct run_config *rc;
     int nrc = 0;
     parse_args(argc, argv, &nrc, &rc);
@@ -191,7 +276,7 @@ int main(int argc, char **argv)
         error("No run configurations parsed", ERROR);
     }
 
-    // If indices span many pages, compress them so that there are no 
+    // If indices span many pages, compress them so that there are no
     // pages in the address space which are never accessed
     // Pages are assumed to be 4KiB
     if (compress_flag) {
@@ -203,7 +288,7 @@ int main(int argc, char **argv)
     struct run_config *rc2 = rc;
 
     // Allocate space for timing and papi counter information
-    
+
     for (int i = 0; i < nrc; i++) {
         rc2[i].time_ms = (double*)malloc(sizeof(double) * rc2[i].nruns);
 #ifdef USE_PAPI
@@ -223,7 +308,7 @@ int main(int argc, char **argv)
     if (err !=PAPI_VER_CURRENT && err > 0) {
         error ("PAPI library version mismatch", ERROR);
     }
-    if (err < 0) papi_err(err);
+    if (err < 0) papi_err(err, __LINE__, __FILE__);
     err = PAPI_is_initialized();
     if (err != PAPI_LOW_LEVEL_INITED) {
         error ("PAPI was not initialized", ERROR);
@@ -232,13 +317,13 @@ int main(int argc, char **argv)
     // OK, now that papi is finally initialized, we need to make our EventSet
     // First, convert names to codes
     for (int i = 0; i < papi_nevents; i++) {
-        papi_err(PAPI_event_name_to_code(papi_event_names[i],&papi_event_codes[i]));
+        papi_err(PAPI_event_name_to_code(papi_event_names[i],&papi_event_codes[i]), __LINE__, __FILE__);
     }
 
     int EventSet = PAPI_NULL;
-    papi_err(PAPI_create_eventset(&EventSet));
+    papi_err(PAPI_create_eventset(&EventSet), __LINE__, __FILE__);
     for (int i = 0; i < papi_nevents; i++) {
-        papi_err(PAPI_add_event(EventSet, papi_event_codes[i]));
+        papi_err(PAPI_add_event(EventSet, papi_event_codes[i]), __LINE__, __FILE__);
     }
 
 #endif
@@ -257,15 +342,16 @@ int main(int argc, char **argv)
     // =======================================
     // Compute Buffer Sizes
     // =======================================
-    
+
     if (rc2[0].kernel != GATHER && rc2[0].kernel != SCATTER) {
         printf("Error: Unsupported kernel\n");
         exit(1);
     }
     size_t max_source_size = 0;
     size_t max_target_size = 0;
+    size_t max_pat_len = 0;
     size_t max_ptrs = 0;
-    size_t max_nruns = 0;
+    size_t max_ro_len = 0;
     for (int i = 0; i < nrc; i++) {
 
         size_t max_pattern_val = rc2[i].pattern[0];
@@ -274,8 +360,11 @@ int main(int argc, char **argv)
                 max_pattern_val = rc2[i].pattern[j];
             }
         }
-        
+
+        //printf("count: %zu, delta: %zu, %zu\n", rc2[i].generic_len, rc2[i].delta, rc2[i].generic_len*rc2[i].delta);
+
         size_t cur_source_size = ((max_pattern_val + 1) + (rc2[i].generic_len-1)*rc2[i].delta) * sizeof(sgData_t);
+        //printf("max_pattern_val: %zu, source_size %zu\n", max_pattern_val, cur_source_size);
         if (cur_source_size > max_source_size) {
             max_source_size = cur_source_size;
         }
@@ -287,6 +376,37 @@ int main(int argc, char **argv)
 
         if (rc2[i].omp_threads > max_ptrs) {
             max_ptrs = rc2[i].omp_threads;
+        }
+
+        if (rc2[i].pattern_len > max_pat_len) {
+            max_pat_len = rc2[i].pattern_len;
+        }
+
+        if (rc2[i].ro_morton == 1) {
+            rc2[i].ro_order = z_order_1d(rc2[i].generic_len, rc2[i].ro_block);
+        } else if (rc2[i].ro_morton == 2) {
+            rc2[i].ro_order = z_order_2d(isqrt(rc2[i].generic_len), rc2[i].ro_block);
+        } else if (rc2[i].ro_morton == 3) {
+            rc2[i].ro_order = z_order_3d(icbrt(rc2[i].generic_len), rc2[i].ro_block);
+        }
+
+        if (rc2[i].ro_hilbert == 1) {
+            //yes, use z order function
+            rc2[i].ro_order = z_order_1d(rc2[i].generic_len, rc2[i].ro_block);
+        } else if (rc2[i].ro_hilbert == 2) {
+            error ("Not yet implemented", ERROR);
+        } else if (rc2[i].ro_hilbert == 3) {
+            rc2[i].ro_order = h_order_3d(icbrt(rc2[i].generic_len), rc2[i].ro_block);
+        }
+
+        if ((rc2[i].ro_hilbert || rc2[i].ro_morton) && !rc2[i].ro_order) {
+            error("Unable to generate reorder pattern.", ERROR);
+        }
+
+        if (rc2[i].ro_morton || rc[i].ro_morton) {
+            if (rc2[i].generic_len > max_ro_len) {
+                max_ro_len = rc2[i].generic_len;
+            }
         }
     }
 
@@ -315,15 +435,16 @@ int main(int argc, char **argv)
     // =======================================
     // Create Host Buffers, Fill With Data
     // =======================================
-    source.host_ptr = (sgData_t*) sp_malloc(source.size, 1, ALIGN_CACHE); 
+    source.host_ptr = (sgData_t*) sp_malloc(source.size, 1, ALIGN_CACHE);
 
     // replicate the target space for every thread
     target.host_ptrs = (sgData_t**) sp_malloc(sizeof(sgData_t*), target.nptrs, ALIGN_CACHE);
     for (size_t i = 0; i < target.nptrs; i++) {
         target.host_ptrs[i] = (sgData_t*) sp_malloc(target.size, 1, ALIGN_PAGE);
     }
+    //    printf("-- here -- \n");
 
-    // Populate buffers cn host 
+    // Populate buffers on host
     #pragma omp parallel for
     for (int i = 0; i < source.len; i++) {
         source.host_ptr[i] = i % (source.len / 64);
@@ -341,26 +462,26 @@ int main(int argc, char **argv)
     #endif
 
     #ifdef USE_CUDA
+    sgIdx_t *pat_dev;
+    uint32_t *order_dev;
     if (backend == CUDA) {
         //TODO: Rewrite to not take index buffers
-        //create_dev_buffers_cuda(&source, &target, &si, &ti);
+        create_dev_buffers_cuda(&source);
+        cudaMalloc((void**)&pat_dev, sizeof(sgIdx_t) * max_pat_len);
+        cudaMalloc((void**)&order_dev, sizeof(uint32_t) * max_ro_len);
         cudaMemcpy(source.dev_ptr_cuda, source.host_ptr, source.size, cudaMemcpyHostToDevice);
-        /*
-        cudaMemcpy(si.dev_ptr_cuda, si.host_ptr, si.size, cudaMemcpyHostToDevice);
-        cudaMemcpy(ti.dev_ptr_cuda, ti.host_ptr, ti.size, cudaMemcpyHostToDevice);
-        */
         cudaDeviceSynchronize();
     }
     #endif
 
-    
+
     // =======================================
     // Execute Benchmark
     // =======================================
-    
+
     // Print some header info
     /*
-    if (print_header_flag) 
+    if (print_header_flag)
     {
         print_system_info();
         emit_configs(rc2, nrc);
@@ -382,76 +503,41 @@ int main(int argc, char **argv)
     // Print config info
 
     for (int k = 0; k < nrc; k++) {
-        // Time OpenCL Kernel 
+        // Time OpenCL Kernel
         #ifdef USE_OPENCL
         if (backend == OPENCL) {
-
-            //TODO: Rewrite without index buffers
-            /*
-            global_work_size = si.len / vector_len;
-            assert(global_work_size > 0);
-            cl_ulong start = 0, end = 0; 
-            for (int i = 0; i <= R; i++) {
-                 
-                start = 0; end = 0;
-
-               cl_event e = 0; 
-
-                SET_4_KERNEL_ARGS(sgp, target.dev_ptr_opencl, source.dev_ptr_opencl,
-                        ti.dev_ptr_opencl, si.dev_ptr_opencl);
-
-                CALL_CL_GUARDED(clEnqueueNDRangeKernel, (queue, sgp, work_dim, NULL, 
-                           &global_work_size, &local_work_size, 
-                          0, NULL, &e)); 
-                clWaitForEvents(1, &e);
-
-                CALL_CL_GUARDED(clGetEventProfilingInfo, 
-                        (e, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start, NULL));
-                CALL_CL_GUARDED(clGetEventProfilingInfo, 
-                        (e, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end, NULL));
-
-                cl_ulong time_ns = end - start;
-                double time_s = time_ns / 1000000000.;
-                if (i!=0) report_time(time_s, source.size, target.size, si.size, vector_len, rc);
-
-            }
-            */
 
         }
         #endif // USE_OPENCL
 
-        // Time CUDA Kernel 
+        // Time CUDA Kernel
         #ifdef USE_CUDA
+        int wpt = 1;
         if (backend == CUDA) {
+            float time_ms = 2;
+            for (int i = -10; i < (int)rc2[k].nruns; i++) {
+#define arr_len (1)
+                unsigned long global_work_size = rc2[k].generic_len / wpt * rc2[k].pattern_len;
+                unsigned long local_work_size = rc2[k].local_work_size;
+                unsigned long grid[arr_len]  = {global_work_size/local_work_size};
+                unsigned long block[arr_len] = {local_work_size};
+                if (rc2[k].random_seed == 0) {
+                    time_ms = cuda_block_wrapper(arr_len, grid, block, rc2[k].kernel, source.dev_ptr_cuda, pat_dev, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap, wpt, rc2[k].ro_morton, rc2[k].ro_order, order_dev, rc[k].stride_kernel);
+                } else {
+                    time_ms = cuda_block_random_wrapper(arr_len, grid, block, rc2[k].kernel, source.dev_ptr_cuda, pat_dev, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap, wpt, rc2[k].random_seed);
+                }
 
-            //TODO: Rewrite without index buffers
-            /*
-            global_work_size = si.len / vector_len;
-            long start = 0, end = 0; 
-            for (int i = 0; i <= R; i++) {
-                 
-                start = 0; end = 0;
-#define arr_len (1) 
-                unsigned int grid[arr_len]  = {global_work_size/local_work_size};
-                unsigned int block[arr_len] = {local_work_size};
-                
-                float time_ms = cuda_sg_wrapper(kernel, vector_len, 
-                        arr_len, grid, block, target.dev_ptr_cuda, source.dev_ptr_cuda, 
-                       ti.dev_ptr_cuda, si.dev_ptr_cuda, shmem); 
-                cudaDeviceSynchronize();
-
-                double time_s = time_ms / 1000.;
-                if (i!=0) report_time(time_s, source.size, target.size, si.size, vector_len, rc);
-
+                if (i>=0) rc2[k].time_ms[i] = time_ms;
             }
-            */
+
 
         }
+
         #endif // USE_CUDA
 
 
 
-        // Time OpenMP Kernel 
+        // Time OpenMP Kernel
         #ifdef USE_OPENMP
         if (backend == OPENMP) {
             omp_set_num_threads(rc2[k].omp_threads);
@@ -461,7 +547,7 @@ int main(int argc, char **argv)
 
                 if (i!=-1) sg_zero_time();
 #ifdef USE_PAPI
-                if (i!=-1) profile_start(EventSet);
+                if (i!=-1) profile_start(EventSet, __LINE__, __FILE__);
 #endif
 
                 switch (rc2[k].kernel) {
@@ -473,7 +559,10 @@ int main(int argc, char **argv)
                         }
                         break;
                     case SCATTER:
-                        if (rc2[k].op == OP_COPY) {
+                        if (rc2[k].random_seed >= 1) {
+                            scatter_smallbuf_random(source.host_ptr, target.host_ptrs, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap, rc2[k].random_seed);
+                        }
+                        else if (rc2[k].op == OP_COPY) {
                             scatter_smallbuf(source.host_ptr, target.host_ptrs, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
                             // scatter_omp (target.host_ptr, ti.host_ptr, source.host_ptr, si.host_ptr, index_len);
                         } else {
@@ -481,8 +570,15 @@ int main(int argc, char **argv)
                         }
                         break;
                     case GATHER:
-                        if (rc2[k].deltas_len <= 1) {
-                            gather_smallbuf(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
+                        if (rc2[k].random_seed >= 1) {
+                            gather_smallbuf_random(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap, rc2[k].random_seed);
+                        }
+                        else if (rc2[k].deltas_len <= 1) {
+                            if (rc2[k].ro_morton || rc2[k].ro_hilbert) {
+                                gather_smallbuf_morton(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap, rc2[k].ro_order);
+                            } else {
+                                gather_smallbuf(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
+                            }
                         } else {
                             gather_smallbuf_multidelta(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].deltas_ps, rc2[k].generic_len, rc2[k].wrap, rc2[k].deltas_len);
                         }
@@ -493,7 +589,7 @@ int main(int argc, char **argv)
                 }
 
 #ifdef USE_PAPI
-                if (i!= -1) profile_stop(EventSet, rc2[k].papi_ctr[i]);
+                if (i!= -1) profile_stop(EventSet, rc2[k].papi_ctr[i], __LINE__, __FILE__);
 #endif
                 if (i!= -1) rc2[k].time_ms[i] = sg_get_time_ms();
 
@@ -502,36 +598,36 @@ int main(int argc, char **argv)
             //report_time2(rc2, nrc);
         }
         #endif // USE_OPENMP
-        
-        // Time Serial Kernel 
+
+        // Time Serial Kernel
         #ifdef USE_SERIAL
         if (backend == SERIAL) {
 
-            // Start at -1 to do a cache warm
-            for (int i = -1; i < (int)rc2[k].nruns; i++) {
+            for (int i = 0; i <= rc2[k].nruns; i++) {
 
                 if (i!=-1) sg_zero_time();
 #ifdef USE_PAPI
-                if (i!=-1) profile_start(EventSet);
+                if (i!=-1) profile_start(EventSet, __LINE__, __FILE__);
 #endif
 
                 switch (rc2[k].kernel) {
                     case SCATTER:
-                            scatter_smallbuf_serial(source.host_ptr, target.host_ptrs, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
+                        scatter_smallbuf_serial(source.host_ptr, target.host_ptrs, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
                         break;
                     case GATHER:
-                            gather_smallbuf_serial(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
+                        gather_smallbuf_serial(target.host_ptrs, source.host_ptr, rc2[k].pattern, rc2[k].pattern_len, rc2[k].delta, rc2[k].generic_len, rc2[k].wrap);
                         break;
                     default:
                         printf("Error: Unable to determine kernel\n");
                         break;
                 }
 
+                //double time_ms = sg_get_time_ms();
+                //if (i!=0) report_time(k, time_ms/1000., rc2[k], i);
 #ifdef USE_PAPI
-                if (i!= -1) profile_stop(EventSet, rc2[k].papi_ctr[i]);
+                if (i!= -1) profile_stop(EventSet, rc2[k].papi_ctr[i], __LINE__, __FILE__);
 #endif
                 if (i!= -1) rc2[k].time_ms[i] = sg_get_time_ms();
-
             }
 
     }
@@ -539,7 +635,21 @@ int main(int argc, char **argv)
 
     report_time2(rc2, nrc);
     
-   }//end for loop for each test
+
+#ifdef USE_CUDA
+    cudaMemcpy(source.host_ptr, source.dev_ptr_cuda, source.size, cudaMemcpyDeviceToHost);
+#endif
+    int good = 0;
+    int bad  = 0;
+    for (int i = 0; i < source.len; i++) {
+        if (source.host_ptr[i] == 1337.) {
+            good++;
+        }else {
+            bad++;
+        }
+    }
+    //printf("\ngood: %d, bad: %d\n", good, bad);
+
 
     // =======================================
     // Validation
@@ -550,7 +660,7 @@ int main(int argc, char **argv)
 /*
 #ifdef USE_OPENCL
         if (backend == OPENCL) {
-            clEnqueueReadBuffer(queue, target.dev_ptr_opencl, 1, 0, target.size, 
+            clEnqueueReadBuffer(queue, target.dev_ptr_opencl, 1, 0, target.size,
                 target.host_ptr, 0, NULL, &e);
             clWaitForEvents(1, &e);
         }
@@ -567,7 +677,7 @@ int main(int argc, char **argv)
         }
 #endif
 
-        sgData_t *target_backup_host = (sgData_t*) sg_safe_cpu_alloc(target.size); 
+        sgData_t *target_backup_host = (sgData_t*) sg_safe_cpu_alloc(target.size);
         memcpy(target_backup_host, target.host_ptr, target.size);
 
     // =======================================
@@ -577,7 +687,7 @@ int main(int argc, char **argv)
     if(validate_flag) {
 #ifdef USE_OPENCL
         if (backend == OPENCL) {
-            clEnqueueReadBuffer(queue, target.dev_ptr_opencl, 1, 0, target.size, 
+            clEnqueueReadBuffer(queue, target.dev_ptr_opencl, 1, 0, target.size,
                 target.host_ptr, 0, NULL, &e);
             clWaitForEvents(1, &e);
         }
@@ -594,7 +704,7 @@ int main(int argc, char **argv)
         }
 #endif
 
-        sgData_t *target_backup_host = (sgData_t*) sg_safe_cpu_alloc(target.size); 
+        sgData_t *target_backup_host = (sgData_t*) sg_safe_cpu_alloc(target.size);
         memcpy(target_backup_host, target.host_ptr, target.size);
 
     	// TODO: Issue - 13: Replace the hard-coded execution of each function with calls to the serial backend
@@ -630,18 +740,33 @@ int main(int argc, char **argv)
         }
         */
     //}
-  }
+    }
 
-  // Free Memory
-  free(source.host_ptr);
-  for (size_t i = 0; i < target.nptrs; i++) {
+    // Free Memory
+    free(source.host_ptr);
+    for (size_t i = 0; i < target.nptrs; i++) {
       free(target.host_ptrs[i]);
-  }
-  if (target.nptrs != 0) {
+    }
+    if (target.nptrs != 0) {
       free(target.host_ptrs);
-  }
+    }
+
+    for (int i = 0; i < nrc; i++) {
+        if (rc2[i].ro_order) {
+            free(rc2[i].ro_order);
+        }
+        free(rc2[i].time_ms);
+#ifdef USE_PAPI
+        for (int j = 0; j < rc2[i].nruns; j++){
+            free(rc2[i].papi_ctr[j]);
+        }
+        free(rc2[i].papi_ctr);
+#endif
+    }
+
   free(rc);
-} 
+  //printf("Mem used: %lld MiB\n", get_mem_used()/1024/1024);
+}
 
 void emit_configs(struct run_config *rc, int nconfigs)
 {
@@ -659,7 +784,7 @@ void emit_configs(struct run_config *rc, int nconfigs)
         // Pattern Type
         printf("\'name\':\'%s\', ", rc[i].name);
 
-        // Kernel 
+        // Kernel
         switch (rc[i].kernel) {
         case GATHER:
             printf("\'kernel\':\'Gather\', ");
@@ -670,9 +795,12 @@ void emit_configs(struct run_config *rc, int nconfigs)
         case SG:
             printf("\'kernel\':\'GS\', ");
             break;
+        case INVALID_KERNEL:
+            error ("Invalid kernel sent to emit_configs", ERROR);
+            break;
         }
 
-        // Pattern 
+        // Pattern
         printf("\'pattern\':[");
         for (int j = 0; j < rc[i].pattern_len; j++) {
             printf("%zu", rc[i].pattern[j]);
@@ -681,7 +809,7 @@ void emit_configs(struct run_config *rc, int nconfigs)
             }
         }
         printf("], ");
-        
+
         //Delta
         //TODO: multidelta
         if (rc[i].deltas_len == 1) {
@@ -695,18 +823,22 @@ void emit_configs(struct run_config *rc, int nconfigs)
                 }
             }
             printf("]");
-            
+
         }
         printf(", ");
 
         // Len
         printf("\'length\':%zu, ", rc[i].generic_len);
 
+        if (rc[i].random_seed > 0) {
+            printf("\'seed\':%zu, ", rc[i].random_seed);
+        }
+
         // Aggregate
         if (aggregate_flag) {
             printf("\'agg\':%zu, ", rc[i].nruns);
         }
-        
+
         // Wrap
         if (aggregate_flag) {
             printf("\'wrap\':%zu, ", rc[i].wrap);
@@ -717,6 +849,24 @@ void emit_configs(struct run_config *rc, int nconfigs)
             printf("\'threads\':%zu", rc[i].omp_threads);
         }
 
+        // OpenMP Threads
+        if (rc[i].stride_kernel!=-1) {
+            printf("\'stride_kernel\':%d", rc[i].stride_kernel);
+        }
+
+        // Morton
+        if (rc[i].ro_morton) {
+            printf(", \'morton\':%d", rc[i].ro_morton);
+        }
+
+        // Morton
+        if (rc[i].ro_hilbert) {
+            printf(", \'hilbert\':%d", rc[i].ro_hilbert);
+        }
+
+        if (rc[i].ro_morton || rc[i].ro_hilbert) {
+            printf(", \'roblock\':%d", rc[i].ro_block);
+        }
 
         printf("}");
 
@@ -726,4 +876,45 @@ void emit_configs(struct run_config *rc, int nconfigs)
 
     }
     printf(" ]\n\n");
+}
+
+// From http://www.codecodex.com/wiki/Calculate_an_integer_square_root
+uint64_t isqrt(uint64_t x)
+{
+    uint64_t op, res, one;
+
+    op = x;
+    res = 0;
+
+    /* "one" starts at the highest power of four <= than the argument. */
+    one = 1 << 30;  /* second-to-top bit set */
+    while (one > op) one >>= 2;
+
+    while (one != 0) {
+
+        if (op >= res + one) {
+            op -= res + one;
+            res += one << 1;  // <-- faster than 2 * one
+        }
+        res >>= 1;
+        one >>= 2;
+    }
+    return res;
+}
+
+// From https://gist.github.com/anonymous/729557
+uint64_t icbrt(uint64_t x) {
+    int s;
+    uint64_t y;
+    uint64_t b;
+    y = 0;
+    for (s = 63; s >= 0; s -= 3) {
+        y += y;
+        b = 3*y*((uint64_t) y + 1) + 1;
+        if ((x >> s) >= b) {
+                x -= b << s;
+                y++;
+        }
+    }
+    return y;
 }

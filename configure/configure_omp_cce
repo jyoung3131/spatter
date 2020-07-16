@@ -1,6 +1,9 @@
 # Configure file for compiling with Cray (CCE) OpenMP
 # Execute from the main directory using ./configure/configure_omp_cce
 
+#Run the submodule update script
+./configure/git_submodule_init.sh
+
 BUILD_DIR=build_omp_cce
 
 mkdir -p ${BUILD_DIR} && cd ${BUILD_DIR}

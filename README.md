@@ -1,5 +1,16 @@
 # Spatter 
-This is a microbenchmark for timing Gather/Scatter kernels on CPUs and GPUs. View the [source](https://github.com/hpcgarage/spatter), and please submit an issue on Github if you run into any issues.
+This is a microbenchmark for timing Gather/Scatter kernels on CPUs and GPUs. View the [source](https://github.com/hpcgarage/spatter), and please submit an issue on Github if you run into any issues. 
+
+## Publications and Citing Spatter
+
+Please see our latest paper submission on [arXiv](https://arxiv.org/abs/1811.03743) for experimental results and more discussion of the tool. If you use Spatter in your work, please cite it from the ArXiv bibtex listing.
+
+### Other recent publications 
+* [SC19 Student Research Competition Poster](https://sc19.supercomputing.org/proceedings/src_poster/src_poster_pages/spostg136.html) ([PDF](https://github.com/hpcgarage/spatter/wiki/pubs/sc19/plavin_spatter_poster_sc19.pdf))
+* [SC19 poster abstract (PDF)](https://github.com/hpcgarage/spatter/wiki/pubs/sc19/plavin_spatter_abstract_sc19.pdf)
+
+### Slides 
+* [SC19 Georgia Tech Booth Talk (PDF)](https://github.com/hpcgarage/spatter/wiki/pubs/sc19/plavin_spatter_booth_talk_sc19.pdf)
 
 ## Purpose 
 For some time now, memory has been the bottleneck in modern computers. As CPUs grow more memory hungry due to increased clock speeds, an increased number of cores, and larger vector units, memory bandwidth and latency continue to stagnate.  While increasingly complex cache hierarchies have helped ease this problem, they are best suited for regular memory accesses with large amounts of locality. However, there are many programs which do not display regular memory patterns and do not reuse data much, and thus do not benefit from such hierarchies. Irregular programs, which include many sparse matrix and graph algorithms, drive us to search  for new approaches to better utilize what little memory bandwidth is available. 
@@ -80,23 +91,33 @@ Spatter has a large number of arguments, broken up into two types. Backend confi
 Backend configuration arguments determine which language and device will be used. Spatter can be compiled with support for multiple backends, so it is possible to choose between backends and devices at runtime. Spatter will attempt intelliigently pick a backend for you, so you may not need to worry about these arguments at all! It is only necessary to specifiy which `--backend` you want if you have compiled with support for more than one, and it is only necessary to specify which `--device` you want if there would be ambiguity (for instance, if you have more than one GPU available). If you want to see what Spatter has chosen for you, you can run with `--verbose`.
 
 ```
-./spatter <arguments>
-    -b, --backend=<backend>
-        Specify backend: OpenCL, OpenMP, CUDA, or Serial
-    --cl-platform=<platform>
-        Specify platform if using OpenCL (case-insensitve, fuzzy matching)
-    --cl-device=<device>
-        Specify device if using OpenCL (case-insensitve, fuzzy matching)
-    --interactive
-        Pick the platform and device interactively
-    -f, --kernel-file=<file>
-        Specify the location of an OpenCL kernel file
-    -q, --no-print-header
-        Do not print header info. (May be repeated up to 3 times.)
-    --verbose
-        Print info about default arguments that you have not overridden
-    --aggregate=<0,1>
-        Report a minimum time for all runs of a given configuration for 2 or more runs [Default 1] (Do not use with PAPI) 
+./spatter --help
+Usage:
+ [-qiac] [--help] [--verbose] [--validate] -p <pattern> [-k <kernel>] [-o <s>] [-d <delta[,delta,...]>] [-l <n>] [-w <n>] [-R <n>] [-t <n>] [-v <n>] [-z <n>] [-m <n>] [-n <name>] [-s [<n>]] [-b <backend>] [--cl-platform=<platform>] [--cl-device=<device>] [-f <FILE>] [--morton=<n>] [--hilbert=<n>] [--roblock=<n>] [--stride=<n>] [--papi=<s>]
+ --help                       Displays info about commands and then exits.
+ --verbose                    Print info about default arguments that you have not overridden.
+ -q, --no-print-header        Do not print header information.
+ -i, --interactive            Pick the platform and the device interactively.
+ --validate                   TODO
+ -a, --aggregate              Report a minimum time for all runs of a given configuration for 2 or more runs. [Default 1] (Do not use with PAPI)
+ -c, --compress               TODO
+ -p, --pattern=<pattern>      Specify either a a built-in pattern (i.e. UNIFORM), a custom pattern (i.e. 1,2,3,4), or a path to a json file with a run-configuration.
+ -k, --kernel-name=<kernel>   Specify the kernel you want to run. [Default: Gather]
+ -o, --op=<s>                 TODO
+ -d, --delta=<delta[,delta,...]> Specify one or more deltas. [Default: 8]
+ -l, --count=<n>              Number of Gathers or Scatters to perform.
+ -w, --wrap=<n>               Number of independent slots in the small buffer (source buffer if Scatter, Target buffer if Gather. [Default: 1]
+ -R, --runs=<n>               Number of times to repeat execution of the kernel. [Default: 10]
+ -t, --omp-threads=<n>        Number of OpenMP threads. [Default: OMP_MAX_THREADS]
+ -v, --vector-len=<n>         TODO
+ -z, --local-work-size=<n>    Numer of Gathers or Scatters performed by each thread on a GPU.
+ -m, --shared-memory=<n>      Amount of dummy shared memory to allocate on GPUs (used for occupancy control).
+ -n, --name=<name>            Specify and name this configuration in the output.
+ -s, --random=[<n>]           Sets the seed, or uses a random one if no seed is specified.
+ -b, --backend=<backend>      Specify a backend: OpenCL, OpenMP, CUDA, or Serial.
+ --cl-platform=<platform>     Specify platform if using OpenCL (case-insensitive, fuzzy matching).
+ --cl-device=<device>         Specify device if using OpenCL (case-insensitive, fuzzy matching).
+ -f, --kernel-file=<FILE>     Specify the location of an OpenCL kernel file.
 ```
         
         
@@ -146,6 +167,17 @@ Mostly Stride-1
         E.g. MS1:8:4:32 -> [0,1,2,3,35,36,37,38]
              MS1:8:2,3:20 -> [0,1,21,41,42,43,44,45]
              MS1:8:2,3:20,22 -> [0,1,21,43,44,45,46,47]
+Laplacian:
+    -pLAPLACIAN:<dimension>:<pseudo_order>:<problem_size>
+        dimension: The dimension of the stencil
+        pseudo_order: The length of a branch of the stencil
+        problem_size: The length of each dimension of the problem
+        E.g. LAPLACIAN:1:1:100 -> [0,1,2] // 3-point stencil
+             LAPLACIAN:2:1:100 -> [0,99,100,101,200] // 5-point stencil
+             LAPLACIAN:2:2:100 -> [0,100,198,199,200,201,202,300,400] // 9-point stencil
+             LAPLACIAN:3:1:100 -> [0,9900,9999,10000,10001,10100,20000] // 7-point stencil (3D)
+
+        The default delta is 1 for Laplacian patterns
 
 ```
 
@@ -156,8 +188,8 @@ Custom:
     -p4,4,4,4,4
 ```
 
-#### Json
-You may specify multiple sets of benchmark configuration options to Spatter inside a Json file. Examples can be found in the `json/` directory. The file format is below. String values should be quoted while numeric values should not be. 
+#### JSON Inputs for Multiple Configurations
+You may specify multiple sets of benchmark configuration options to Spatter inside a JSON file and run them using `./spatter -pFILE=<jsonconfig>.json`. Examples can be found in the `json/` directory. The file format is below. String values should be quoted while numeric values should not be. 
 ```
 [
     {"long-option1":numeric, "long-option2":"string", ...},
@@ -166,6 +198,33 @@ You may specify multiple sets of benchmark configuration options to Spatter insi
 ]
 
 ```
+
+As an example of running with an example JSON configuration. Note that results are provided on a per-pattern basis and summary results are provided for all patterns. This is useful for summarizing pattern results that represent an application kernel. 
+```
+./spatter -pFILE=../json/ustride_small.json                                                  
+
+Running Spatter version 0.0
+Compiler: Clang ver. 7.1.0
+Compiler Location: /sw/wombat/ARM_Compiler/19.2/opt/arm/arm-hpc-compiler-19.2_Generic-AArch64_RHEL-7_aarch64-1/bin/armclang         
+Backend: OPENMP
+Aggregate Results? YES
+
+Run Configurations
+[ {'name':'UNIFORM:8:1:NR', 'kernel':'Gather', 'pattern':[0,1,2,3,4,5,6,7], 'delta':8, 'length':2500, 'agg':10, 'wrap':1, 'threads':112},
+  {'name':'UNIFORM:8:2:NR', 'kernel':'Gather', 'pattern':[0,2,4,6,8,10,12,14], 'delta':16, 'length':1250, 'agg':10, 'wrap':1, 'threads':112},
+  {'name':'UNIFORM:8:4:NR', 'kernel':'Gather', 'pattern':[0,4,8,12,16,20,24,28], 'delta':32, 'length':625, 'agg':10, 'wrap':1, 'threads':112} ]
+
+config  time(s)      bw(MB/s)
+0       0.0008033    199.168
+1       0.0007809    102.445
+2       0.0007738    51.6945
+
+Min          25%          Med          75%          Max
+51.6945      51.6945      102.445      199.168      199.168
+H.Mean       H.StdErr
+87.9079      26.5821
+```
+
 For your convienience, we also provide a python script to help you create configurations quickly. If your json contains arrays, you can pass it into the python script `python/generate_json.py` and it will expand the arrays into multiple configs, each with a single value from the array. Given that you probably don't want your pattern arguments to be expanded like this, they should be specified as python tuples. An example is below. 
 
 ```

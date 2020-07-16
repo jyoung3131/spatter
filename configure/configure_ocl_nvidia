@@ -1,7 +1,11 @@
 # Configure file for compiling with OpenCL
 # Execute from the main directory using ./configure/configure_ocl
 
-#Use the NVIDIA compiler settings
+#Run the submodule update script
+./configure/git_submodule_init.sh
+
+# Use the NVIDIA compiler settings
+# TBD - needs to be updated to use FindOpenCL with cmake
 . setenv_ocl.sh 3
 
 BUILD_DIR=build_ocl
